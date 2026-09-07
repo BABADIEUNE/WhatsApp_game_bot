@@ -295,11 +295,13 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
+    const LOG_LEVEL = process.env.LOG_LEVEL || "silent";
+
     const sock = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: false,
-        logger: pino({ level: "silent" }),
+        logger: pino({ level: LOG_LEVEL }),
         browser: ["Game Bot", "Chrome", "1.0.0"]
     });
 
