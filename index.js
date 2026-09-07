@@ -7,11 +7,9 @@ const {
     default: makeWASocket,
     useMultiFileAuthState,
     fetchLatestBaileysVersion,
+    fetchLatestWaWebVersion,
     DisconnectReason,
-    delay,
-    proto,
-    generateWAMessageFromContent,
-    isJidGroup
+    delay
 } = require("@whiskeysockets/baileys");
 
 const pino = require("pino");
@@ -23,7 +21,6 @@ const PREFIX = process.env.PREFIX || "!";
 const BASE_URL = process.env.BASE_URL;
 const PORT = process.env.PORT || 3000;
 const PHONE_NUMBER = (process.env.PHONE_NUMBER || "").replace(/[^0-9]/g, "");
-const MENU_PAGE_SIZE = 6;
 
 if (!BASE_URL) {
     console.error(
@@ -46,246 +43,8 @@ function ask(question) {
     return new Promise((resolve) => rl.question(question, resolve));
 }
 
-function jsonButton(name, params) {
-    return {
-        name,
-        buttonParamsJson: JSON.stringify(params)
-    };
-}
-
-/**
- * Envoie un vrai message WhatsApp Native Flow avec generateWAMessageFromContent.
- *
- * Important : WhatsApp ne permet pas d'exécuter arbitrairement du HTML/JavaScript
- * directement dans une bulle de chat. Ici, l'interactivité native est utilisée
- * pour le menu, les réponses rapides et les boutons qui ouvrent le jeu HTML5.
- */
-function buildMixedNativeFlowBizNode() {
-    return {
-        tag: "biz",
-        attrs: {
-            actual_actors: "2",
-            host_storage: "2",
-            privacy_mode_ts: (Math.floor(Date.now() / 1000) - 77980457).toString()
-        },
-        content: [
-            {
-                tag: "interactive",
-                attrs: { type: "native_flow", v: "1" },
-                content: [
-                    {
-                        tag: "native_flow",
-                        attrs: { v: "9", name: "mixed" }
-                    }
-                ]
-            },
-            {
-                tag: "quality_control",
-                attrs: { source_type: "third_party" }
-            }
-        ]
-    };
-}
-
-async function sendInteractiveMessage(sock, jid, { title, body, footer, buttons, quoted }) {
-    try {
-        const nativeFlowButtons = buttons.map((button) =>
-            proto.Message.InteractiveMessage.NativeFlowMessage.NativeFlowButton.create(button)
-        );
-
-        const interactive = proto.Message.InteractiveMessage.create({
-            body: proto.Message.InteractiveMessage.Body.create({
-                text: body || ""
-            }),
-            footer: proto.Message.InteractiveMessage.Footer.create({
-                text: footer || ""
-            }),
-            header: proto.Message.InteractiveMessage.Header.create({
-                title: title || "",
-                hasMediaAttachment: false
-            }),
-            nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.create({
-                buttons: nativeFlowButtons,
-                messageParamsJson: "{}",
-                messageVersion: 1
-            })
-        });
-
-        const generated = generateWAMessageFromContent(
-            jid,
-            { interactiveMessage: interactive },
-            {
-                quoted,
-                userJid: sock.user?.id
-            }
-        );
-
-        const bizNode = buildMixedNativeFlowBizNode();
-        const botNode = { tag: "bot", attrs: { biz_bot: "1" } };
-        const additionalNodes = isJidGroup(jid)
-            ? [bizNode]
-            : [botNode, bizNode];
-
-        await sock.relayMessage(jid, generated.message, {
-            messageId: generated.key.id,
-            additionalNodes
-        });
-
-        return true;
-    } catch (error) {
-        console.error("[interactive] Impossible d'envoyer le message interactif :", error);
-        return false;
-    }
-}
-
-function getButtonId(msg) {
-    const nativeFlow = msg?.message?.interactiveResponseMessage?.nativeFlowResponseMessage;
-
-    if (nativeFlow?.paramsJson) {
-        try {
-            const params = JSON.parse(nativeFlow.paramsJson);
-            return params.id || params.selected_id || params.selected_row_id || params.row_id || null;
-        } catch (_) {}
-    }
-
-    const buttonResponse = msg?.message?.buttonsResponseMessage;
-    if (buttonResponse?.selectedButtonId) return buttonResponse.selectedButtonId;
-
-    const templateResponse = msg?.message?.templateButtonReplyMessage;
-    if (templateResponse?.selectedId) return templateResponse.selectedId;
-
-    return null;
-}
-
-async function sendGameCard(sock, jid, game, quoted) {
-    const url = `${BASE_URL.replace(/\/$/, "")}/game/${game.id}`;
-
-    const sent = await sendInteractiveMessage(sock, jid, {
-        title: `🎮 ${game.name}`,
-        body: `${game.description || "Un mini-jeu HTML5."}\n\nChoisis une action ci-dessous 👇`,
-        footer: "WhatsApp Game Bot",
-        quoted,
-        buttons: [
-            jsonButton("cta_url", {
-                display_text: "▶️ JOUER",
-                url,
-                merchant_url: url
-            }),
-            jsonButton("quick_reply", {
-                display_text: "🎮 AUTRES JEUX",
-                id: "games_menu"
-            }),
-            jsonButton("quick_reply", {
-                display_text: "ℹ️ AIDE",
-                id: "help_menu"
-            })
-        ]
-    });
-
-    // Fallback volontaire : si WhatsApp/Baileys refuse le Native Flow,
-    // le bot continue de fonctionner avec un message classique + aperçu URL.
-    if (!sent) {
-        await sock.sendMessage(jid, {
-            text: `🎮 *${game.name}*\n${game.description || ""}\n\n▶️ Jouer : ${url}`,
-            contextInfo: {
-                externalAdReply: {
-                    title: game.name,
-                    body: "Tape pour jouer",
-                    mediaType: 1,
-                    renderLargerThumbnail: true,
-                    showAdAttribution: false,
-                    sourceUrl: url
-                }
-            }
-        }, { quoted });
-    }
-}
-
-async function sendGamesMenu(sock, jid, games, quoted, page = 0) {
-    const allGames = Array.from(games.values());
-    const totalPages = Math.max(1, Math.ceil(allGames.length / MENU_PAGE_SIZE));
-    const safePage = Math.min(Math.max(Number(page) || 0, 0), totalPages - 1);
-    const start = safePage * MENU_PAGE_SIZE;
-    const visibleGames = allGames.slice(start, start + MENU_PAGE_SIZE);
-
-    const rows = visibleGames.map((game) => ({
-        header: "🎮",
-        title: game.name,
-        description: game.description || `Jouer à ${game.name}`,
-        id: `game:${game.id}`
-    }));
-
-    const buttons = [
-        jsonButton("single_select", {
-            title: `🎮 CHOISIR UN JEU (${safePage + 1}/${totalPages})`,
-            sections: [
-                {
-                    title: `Mini-jeux ${start + 1}-${Math.min(start + MENU_PAGE_SIZE, allGames.length)}`,
-                    rows
-                }
-            ]
-        })
-    ];
-
-    if (safePage > 0) {
-        buttons.push(jsonButton("quick_reply", {
-            display_text: "⬅️ PRÉCÉDENT",
-            id: `games_page:${safePage - 1}`
-        }));
-    }
-
-    if (safePage < totalPages - 1) {
-        buttons.push(jsonButton("quick_reply", {
-            display_text: "➡️ SUIVANT",
-            id: `games_page:${safePage + 1}`
-        }));
-    }
-
-    buttons.push(jsonButton("quick_reply", {
-        display_text: "ℹ️ AIDE",
-        id: "help_menu"
-    }));
-
-    const sent = await sendInteractiveMessage(sock, jid, {
-        title: "🎮 MINI-JEUX",
-        body: `Il y a ${games.size} jeu(x) disponible(s).\nPage ${safePage + 1}/${totalPages}.\n\nChoisis ton jeu 👇`,
-        footer: "WhatsApp Game Bot",
-        quoted,
-        buttons
-    });
-
-    if (!sent) {
-        const list = allGames
-            .map((g) => `• ${PREFIX}${g.id} — ${g.name}`)
-            .join("\n");
-
-        await sock.sendMessage(jid, {
-            text: `🎮 *Jeux disponibles*\n\n${list}\n\nTape une commande pour jouer.`
-        }, { quoted });
-    }
-}
-
-async function sendHelp(sock, jid, quoted) {
-    await sendInteractiveMessage(sock, jid, {
-        title: "ℹ️ AIDE",
-        body:
-            `🎮 *Bot de mini-jeux*\n\n` +
-            `• ${PREFIX}jeux — ouvrir le menu interactif\n` +
-            `• ${PREFIX}<jeu> — ouvrir directement un jeu\n\n` +
-            `Tu peux aussi utiliser les boutons directement dans WhatsApp.`,
-        footer: "WhatsApp Game Bot",
-        quoted,
-        buttons: [
-            jsonButton("quick_reply", {
-                display_text: "🎮 OUVRIR LES JEUX",
-                id: "games_menu"
-            })
-        ]
-    });
-}
-
 async function startBot() {
-    const { app, getGames } = createServer();
+    const { app, getGames, reloadGames } = createServer();
 
     app.listen(PORT, () => {
         console.log(`[server] Serveur de jeux lancé sur le port ${PORT}`);
@@ -293,7 +52,34 @@ async function startBot() {
     });
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version } = await fetchLatestBaileysVersion();
+
+    /*
+      IMPORTANT (bug connu Baileys #2679) : fetchLatestBaileysVersion() peut
+      renvoyer une version de "WhatsApp Web" périmée tout en annonçant
+      isLatest: true, ce qui fait échouer le pairing avec "Couldn't link
+      device" côté téléphone. fetchLatestWaWebVersion() renvoie la vraie
+      version actuelle. On l'utilise en priorité, avec repli si absente
+      (versions plus anciennes de la lib).
+    */
+
+    let version;
+
+    try {
+        if (typeof fetchLatestWaWebVersion === "function") {
+            ({ version } = await fetchLatestWaWebVersion());
+        } else {
+            ({ version } = await fetchLatestBaileysVersion());
+        }
+    } catch (e) {
+        console.error(
+            "[version] Erreur lors de la récupération de la version, " +
+            "repli sur fetchLatestBaileysVersion :",
+            e.message
+        );
+        ({ version } = await fetchLatestBaileysVersion());
+    }
+
+    console.log("[version] Version WhatsApp Web utilisée :", version);
 
     const LOG_LEVEL = process.env.LOG_LEVEL || "silent";
 
@@ -305,7 +91,12 @@ async function startBot() {
         browser: ["Game Bot", "Chrome", "1.0.0"]
     });
 
+    /* =========================
+       CONNEXION PAR PAIRING CODE
+    ========================= */
+
     if (!sock.authState.creds.registered) {
+
         let phone = PHONE_NUMBER;
 
         if (!phone) {
@@ -332,6 +123,10 @@ async function startBot() {
             console.error("[pairing] Erreur lors de la demande du code :", e);
         }
     }
+
+    /* =========================
+       ÉVÉNEMENTS DE CONNEXION
+    ========================= */
 
     sock.ev.on("connection.update", (update) => {
         const { connection, lastDisconnect } = update;
@@ -369,81 +164,79 @@ async function startBot() {
 
     sock.ev.on("creds.update", saveCreds);
 
+    /* =========================
+       GESTION DES COMMANDES
+    ========================= */
+
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (type !== "notify") return;
 
-        for (const msg of messages) {
-            try {
-                if (!msg.message || msg.key.fromMe) continue;
+        const msg = messages[0];
 
-                const jid = msg.key.remoteJid;
-                const buttonId = getButtonId(msg);
+        if (!msg.message || msg.key.fromMe) return;
 
-                // Réponses aux boutons Native Flow.
-                if (buttonId) {
-                    const games = getGames();
+        const jid = msg.key.remoteJid;
 
-                    if (buttonId === "games_menu") {
-                        await sendGamesMenu(sock, jid, games, msg, 0);
-                        continue;
-                    }
+        const text = (
+            msg.message.conversation ||
+            (msg.message.extendedTextMessage &&
+                msg.message.extendedTextMessage.text) ||
+            ""
+        ).trim();
 
-                    if (buttonId.startsWith("games_page:")) {
-                        const page = Number(buttonId.slice("games_page:".length));
-                        await sendGamesMenu(sock, jid, games, msg, page);
-                        continue;
-                    }
+        if (!text.startsWith(PREFIX)) return;
 
-                    if (buttonId === "help_menu") {
-                        await sendHelp(sock, jid, msg);
-                        continue;
-                    }
+        const commandBody = text.slice(PREFIX.length).trim().toLowerCase();
+        const [command] = commandBody.split(/\s+/);
 
-                    if (buttonId.startsWith("game:")) {
-                        const gameId = buttonId.slice("game:".length).toLowerCase();
-                        const game = games.get(gameId);
+        const games = getGames();
 
-                        if (game) {
-                            await sendGameCard(sock, jid, game, msg);
-                        } else {
-                            await sendGamesMenu(sock, jid, games, msg);
-                        }
+        /* Commande liste des jeux */
+        if (command === "jeux" || command === "games" || command === "menu") {
+            const list = Array.from(games.values())
+                .map((g) => `• ${PREFIX}${g.id} — ${g.name}`)
+                .join("\n");
 
-                        continue;
-                    }
-                }
+            await sock.sendMessage(jid, {
+                text: `🎮 *Jeux disponibles*\n\n${list}\n\nTape une commande pour recevoir le lien du jeu.`
+            });
 
-                const text = (
-                    msg.message.conversation ||
-                    (msg.message.extendedTextMessage &&
-                        msg.message.extendedTextMessage.text) ||
-                    ""
-                ).trim();
-
-                if (!text.startsWith(PREFIX)) continue;
-
-                const commandBody = text.slice(PREFIX.length).trim().toLowerCase();
-                const [command] = commandBody.split(/\s+/);
-                const games = getGames();
-
-                if (command === "jeux" || command === "games" || command === "menu") {
-                    await sendGamesMenu(sock, jid, games, msg);
-                    continue;
-                }
-
-                if (command === "help" || command === "aide") {
-                    await sendHelp(sock, jid, msg);
-                    continue;
-                }
-
-                const game = games.get(command);
-                if (!game) continue;
-
-                await sendGameCard(sock, jid, game, msg);
-            } catch (error) {
-                console.error("[messages] Erreur lors du traitement d'un message :", error);
-            }
+            return;
         }
+
+        /* Commande d'aide */
+        if (command === "help" || command === "aide") {
+            await sock.sendMessage(jid, {
+                text:
+                    `🎮 *Bot de mini-jeux*\n\n` +
+                    `Tape *${PREFIX}jeux* pour voir la liste complète.\n` +
+                    `Tape *${PREFIX}<nomdujeu>* pour recevoir le lien d'un jeu ` +
+                    `(ex: *${PREFIX}flappy*, *${PREFIX}snake*...).`
+            });
+
+            return;
+        }
+
+        /* Commande correspondant à un jeu précis */
+        const game = games.get(command);
+
+        if (!game) return;
+
+        const url = `${BASE_URL.replace(/\/$/, "")}/game/${game.id}`;
+
+        await sock.sendMessage(jid, {
+            text: `🎮 *${game.name}*\n${game.description || "Tape sur la carte pour jouer 👇"}`,
+            contextInfo: {
+                externalAdReply: {
+                    title: game.name,
+                    body: "Tape pour jouer",
+                    mediaType: 1,
+                    renderLargerThumbnail: true,
+                    showAdAttribution: false,
+                    sourceUrl: url
+                }
+            }
+        });
     });
 
     return sock;
